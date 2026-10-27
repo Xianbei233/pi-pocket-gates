@@ -1,0 +1,216 @@
+/* 需求追问面板：跟随 Pi Pocket 的配色与控件尺度，不自己发明颜色。 */
+
+.spec-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    height: 100%;
+    min-height: 0;
+    padding: 14px 14px 10px;
+    color: var(--text, currentColor);
+    font-size: 13.5px;
+    line-height: 1.45;
+}
+
+.spec-head {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    padding-bottom: 10px;
+    border-bottom: 1px solid var(--hair-2, rgba(128,128,128,.2));
+}
+
+.spec-head strong {
+    font-size: 15px;
+    font-weight: 600;
+    line-height: 1.35;
+}
+
+.spec-meta {
+    font-size: 11.5px;
+    color: var(--muted, color-mix(in oklab, currentColor 60%, transparent));
+}
+
+.spec-list {
+    flex: 1;
+    min-height: 0;
+    overflow-y: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+    padding-right: 4px;
+    scrollbar-width: thin;
+}
+
+.spec-q {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 11px 12px;
+    border: 1px solid var(--hair-2, rgba(128,128,128,.2));
+    border-radius: 12px;
+    background: var(--card, color-mix(in srgb, currentColor 4%, transparent));
+    transition: border-color 140ms var(--ease-out, ease), background-color 140ms var(--ease-out, ease);
+}
+
+.spec-q.is-answered {
+    border-color: var(--accent-line, color-mix(in srgb, var(--accent, #4c8dff) 50%, transparent));
+    background: var(--accent-soft, color-mix(in srgb, var(--accent, #4c8dff) 10%, transparent));
+}
+
+.spec-q-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+}
+
+.spec-dim {
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: .06em;
+    color: var(--accent, #4c8dff);
+}
+
+.spec-done {
+    font-size: 11px;
+    color: var(--ok, #3d9970);
+}
+
+.spec-question {
+    margin: 0 !important;
+    font-size: 13px;
+    line-height: 1.55;
+    color: var(--text, currentColor);
+}
+
+.spec-options {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.spec-option {
+    display: flex;
+    gap: 9px;
+    align-items: flex-start;
+    padding: 6px 8px;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    margin-inline: -4px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: background-color 120ms var(--ease-out, ease), border-color 120ms var(--ease-out, ease);
+}
+
+@media (hover: hover) {
+    .spec-option:hover {
+        background: var(--card-2, color-mix(in srgb, currentColor 7%, transparent));
+    }
+}
+
+/* flex 子项默认按 min-content 收缩，中文就会塌成一列字。必须显式放行。 */
+.spec-option > span {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow-wrap: anywhere;
+}
+
+/* pocket 的全局规则让 input 撑满整行（实测 702px），这里必须收回固定尺寸。 */
+.spec-option input[type="radio"],
+.spec-option input[type="checkbox"] {
+    flex: 0 0 auto;
+    width: 16px;
+    min-width: 16px;
+    height: 16px;
+    padding: 0;
+    margin: 3px 0 0;
+    accent-color: var(--accent, #4c8dff);
+}
+
+.spec-option b {
+    font-weight: 550;
+}
+
+/* 选中项：整行淡主题色，不用勾选框也能一眼看出。 */
+.spec-option:has(input:checked) {
+    background: var(--accent-soft, color-mix(in srgb, var(--accent, #4c8dff) 10%, transparent));
+    border-color: var(--accent-line, color-mix(in srgb, var(--accent, #4c8dff) 40%, transparent));
+}
+
+.spec-option em {
+    display: block;
+    margin-top: 2px;
+    font-style: normal;
+    font-size: 11.5px;
+    line-height: 1.45;
+    color: var(--muted, color-mix(in oklab, currentColor 60%, transparent));
+}
+
+.spec-text {
+    width: 100%;
+    box-sizing: border-box;
+    padding: 8px 10px;
+    font: inherit;
+    font-size: 13px;
+    color: inherit;
+    border: 1px solid var(--hair-2, rgba(128,128,128,.25));
+    border-radius: calc(var(--r-control, 8px) + 1px);
+    background: var(--panel, transparent);
+}
+
+.spec-text:focus {
+    outline: none;
+    border-color: var(--accent-line, color-mix(in srgb, var(--accent, #4c8dff) 50%, transparent));
+}
+
+.spec-error {
+    margin: 0 !important;
+    padding: 8px 10px;
+    font-size: 12.5px;
+    border-radius: 9px;
+    color: var(--err, #e5484d);
+    background: var(--err-soft, color-mix(in srgb, #e5484d 12%, transparent));
+}
+
+.spec-hint {
+    margin: 0 !important;
+    font-size: 12.5px;
+    color: var(--muted, color-mix(in oklab, currentColor 60%, transparent));
+}
+
+.spec-foot {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex-wrap: wrap;
+    padding-top: 10px;
+    border-top: 1px solid var(--hair-2, rgba(128,128,128,.2));
+}
+
+.spec-submit {
+    flex: 0 0 auto;
+}
+
+.spec-waivers {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.spec-waiver {
+    padding: 10px 12px;
+    border: 1px solid var(--accent-line, color-mix(in srgb, var(--accent, #4c8dff) 50%, transparent));
+    border-radius: 11px;
+    background: var(--accent-soft, color-mix(in srgb, var(--accent, #4c8dff) 10%, transparent));
+    font-size: 12.5px;
+}
+
+.spec-waiver p {
+    margin: 0 0 8px !important;
+}
+
+.spec-waiver-actions {
+    display: flex;
+    gap: 8px;
+}
