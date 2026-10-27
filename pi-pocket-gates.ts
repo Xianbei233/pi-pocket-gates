@@ -468,6 +468,28 @@ const LedgerDoc = defineDoc<Ledger>({
     initial: emptyLedger,
 });
 
+/** One conversation that is waiting for the owner, with enough in hand to list it without reading its documents. */
+type InboxEntry = {
+    readonly at: number;
+    readonly count: number;
+    readonly label: string;
+    readonly first: string;
+    readonly answeredAt: number;
+};
+
+type InboxState = { entries: Record<string, InboxEntry> };
+
+/** The cross-conversation inbox: which sessions are waiting, so the panel can show them without opening them. */
+const InboxDoc = defineDoc<InboxState>({
+    kind: "x.pi-pocket-gates.inbox",
+    version: 1,
+    scope: "session",
+    initial: () => ({ entries: {} }),
+});
+
+/** A waiting session drops off the list after this, so a forgotten ask does not stay forever. */
+const INBOX_TTL = 12 * 60 * 60 * 1000;
+
 const openStage = (ledger: Ledger): Stage | undefined => ledger.stages.find((stage) => stage.open);
 
 /** Every dimension a person answered or a person confirmed as deliberately unchecked. */
@@ -953,6 +975,31 @@ export default function createGates(host: Host, web: Web) {
             return copyOf(doc);
         }, context);
 
+    /** The folder's last segment, which is how a waiting session is recognised in a list. */
+    const cwdLabel = async (api: any, context: any): Promise<string> => {
+        const folder = await folderOf(api, context);
+        const parts = folder.split(sep).filter((part: string) => part !== "");
+        return parts.length > 0 ? parts[parts.length - 1] : folder;
+    };
+
+    /** Puts this conversation on the cross-conversation inbox, so the panel shows it from any session. */
+    const rememberAsk = async (api: any, context: any, questions: readonly Question[]): Promise<void> => {
+        const label = await cwdLabel(api, context);
+        const first = questions.length > 0 ? String(questions[0].question) : "";
+        const count = questions.length;
+        await api.commit(async (tx: any) => {
+            const inbox = (await tx.doc(InboxDoc)) ?? { entries: {} };
+            inbox.entries[String(api.conversationId)] = {
+                at: Date.now(),
+                count,
+                label,
+                first: first.slice(0, 160),
+                answeredAt: 0,
+            };
+            return copyOf(inbox);
+        }, context);
+    };
+
     // ─── Requirements ────────────────────────────────────────────────────────
 
     const ask = defineTool({
@@ -1024,6 +1071,7 @@ export default function createGates(host: Host, web: Web) {
                 doc.askedAt = Date.now();
                 doc.answeredAt = 0;
             });
+            await rememberAsk(api, context, normalized);
             web.send("interview", { conversationId: api.conversationId, round: current.round + 1 });
 
             const answered = await new Promise<Record<string, string[]> | undefined>((resolve) => {
@@ -1568,7 +1616,20 @@ export default function createGates(host: Host, web: Web) {
             title: doc.title,
             round: doc.round,
             status: doc.status,
-            questions: doc.questions ?? [],
+            questions: (doc.questions ?? []).filter(
+                (question) => ((doc.answers ?? {})[question.id] ?? []).length === 0,
+            ),
+            answeredCount: (doc.questions ?? []).filter(
+                (question) => ((doc.answers ?? {})[question.id] ?? []).length > 0,
+            ).length,
+            answered: (doc.questions ?? [])
+                .filter((question) => ((doc.answers ?? {})[question.id] ?? []).length > 0)
+                .map((question) => ({
+                    id: question.id,
+                    dimension: question.dimension,
+                    question: question.question,
+                    values: (doc.answers ?? {})[question.id] ?? [],
+                })),
             answers: doc.answers ?? {},
             waived: doc.waived ?? {},
             pendingWaive: doc.pendingWaive ?? {},
@@ -1578,6 +1639,38 @@ export default function createGates(host: Host, web: Web) {
     };
 
     web.client("pi-pocket-gates", { access: "owner" });
+    /**
+     * Every conversation that is waiting, for the panel's single entry point. It answers from this document alone, so
+     * reading it never opens another session's documents.
+     */
+    web.route(
+        "GET",
+        "inbox",
+        async (request: any) => {
+            const inbox = (await request.snapshot(InboxDoc, request.context)) ?? { entries: {} };
+            const now = Date.now();
+            const items: Array<{ conversationId: number | string; label: string; count: number; first: string; at: number }> = [];
+            for (const [id, entry] of Object.entries(inbox.entries ?? {})) {
+                if (entry === null || typeof entry !== "object") {
+                    continue;
+                }
+                if (entry.count <= 0 || now - entry.at > INBOX_TTL) {
+                    continue;
+                }
+                const numeric = Number(id);
+                items.push({
+                    conversationId: Number.isFinite(numeric) ? numeric : id,
+                    label: entry.label,
+                    count: entry.count,
+                    first: entry.first,
+                    at: entry.at,
+                });
+            }
+            items.sort((left, right) => left.at - right.at);
+            return { items };
+        },
+        { access: "owner" },
+    );
     web.conversationRoute(
         "GET",
         "interview/:source",
@@ -1613,6 +1706,8 @@ export default function createGates(host: Host, web: Web) {
                 next.status = "answered";
                 next.answeredAt = Date.now();
                 next.revision += 1;
+                const inbox = (await tx.doc(InboxDoc)) ?? { entries: {} };
+                delete inbox.entries[String(request.conversation.id)];
                 return copyOf(next);
             });
             waiting.get(String(request.conversation.id))?.settle(arriving);
