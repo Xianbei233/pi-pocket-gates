@@ -28,14 +28,6 @@ const dimOf = (key) => DIM_LABEL[key] ?? key;
 export default function setup(pocket) {
     const { html, useState, useEffect, useCallback } = pocket;
 
-    // The single entry point: a top-bar button showing how many conversations are waiting, from any session.
-    const topbar = pocket.topbar({
-        id: "interview-inbox",
-        title: "需求追问",
-        badge: null,
-        onClick: () => pocket.openPanel("interview"),
-    });
-
     function Interview() {
         const [view, setView] = useState(blank());
         const [picks, setPicks] = useState({});
@@ -167,7 +159,7 @@ export default function setup(pocket) {
                     }
                     const items = state?.items ?? [];
                     setInbox(items);
-                    topbar.update({ badge: items.length > 0 ? String(items.length) : null });
+                    panelButton.update({ badge: items.length > 0 ? String(items.length) : null });
                 } catch {
                     // The inbox is a convenience: a failed poll leaves the screen as it was.
                 }
@@ -317,7 +309,8 @@ export default function setup(pocket) {
     }
 
     pocket.style("style.css");
-    pocket.panel({ id: "interview", title: "需求追问", component: Interview });
+    // `panel` already puts one button in the top bar, so the waiting count rides on that same button: one icon, one entry.
+    const panelButton = pocket.panel({ id: "interview", title: "需求追问", component: Interview });
 
     pocket.on("interview-answered", () => {
         pocket.notify("info", "需求回答已记录，模型继续。");
