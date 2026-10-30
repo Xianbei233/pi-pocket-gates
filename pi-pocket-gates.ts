@@ -535,6 +535,29 @@ const settled = (doc: Interview): Set<string> => {
 
 const missing = (doc: Interview): string[] => DIMENSION_KEYS.filter((key) => !settled(doc).has(key));
 
+/**
+ * Dimensions answered with free text rather than one of the offered options.
+ * The owner wrote more than the options covered, so one more round of questions
+ * on that dimension stays allowed even after every dimension is settled.
+ */
+const freeTextDimensions = (doc: Interview): Set<string> => {
+    const out = new Set<string>();
+    for (const question of doc.questions) {
+        const answer = doc.answers[question.id];
+        if (answer === undefined) {
+            continue;
+        }
+        const labels = new Set((question.options ?? []).map((option) => option.label));
+        if (answer.some((value) => value.trim() !== "" && !labels.has(value.trim()))) {
+            const key = dimensionOf(question.dimension);
+            if (key !== undefined) {
+                out.add(key);
+            }
+        }
+    }
+    return out;
+};
+
 const said = (doc: Interview): string =>
     missing(doc)
         .map((key) => key + "（" + (LABELS.get(key) ?? key) + "）")
@@ -1166,9 +1189,10 @@ export default function createGates(host: Host, web: Web) {
         }),
         execute: async ({ title, questions }, api, context) => {
             const current = await readInterview(api, context);
-            if (missing(current).length === 0) {
+            // A dimension the owner answered in free text keeps one more round open: the options did not cover what they said.
+            if (missing(current).length === 0 && freeTextDimensions(current).size === 0) {
                 return reply(
-                    "需求已经收口（7 个维度都有答案或豁免），不要再问一遍：直接 stage_begin 声明这一步要改哪些文件。",
+                    "需求已经收口（7 个维度都有答案或豁免，且没有文本框补充），不要再问一遍：直接 stage_begin 声明这一步要改哪些文件。",
                 );
             }
             if (current.round >= MAX_ROUNDS) {
