@@ -129,6 +129,10 @@ export type BudgetState = {
     /** Evidence checked at test_done, with the plugin's own rerun result. */
     evidence?: EvidenceRun[];
     done: boolean;
+    /** Tool calls charged to the open stage. Rounds x context is the bill, so the round count gets its own ceiling. */
+    spent: number;
+    /** Which stage `spent` belongs to; opening a stage starts the count over. */
+    spentStage: number;
 };
 
 export type TestPlan = { goal: string; checks: string[]; fullLimit: number; at: number };
@@ -141,6 +145,8 @@ export const emptyState = (): BudgetState => ({
     target: "",
     plan: undefined,
     done: false,
+    spent: 0,
+    spentStage: 0,
 });
 
 /** Collapse a command to the part that decides whether it is the same run: whitespace, redirects, and output tails. */
@@ -459,6 +465,22 @@ const InterviewDoc = defineDoc<Interview>({
     initial: emptyInterview,
 });
 
+/**
+ * Local patch (not upstream): the requirement belongs to the folder, not to one conversation.
+ * A subagent that starts later in the same repository therefore reads the same interview and
+ * inherits the Owner's answers instead of asking the same seven questions a second time.
+ */
+type SharedInterviews = { byFolder: Record<string, Interview> };
+
+const SharedDoc = defineDoc<SharedInterviews>({
+    kind: "x.pi-pocket-gates.requirements",
+    version: 1,
+    scope: "session",
+    history: "latest",
+    fork: "initial",
+    initial: () => ({ byFolder: {} }),
+});
+
 const LedgerDoc = defineDoc<Ledger>({
     kind: "x.pi-pocket-spec.ledger",
     version: 1,
@@ -467,6 +489,28 @@ const LedgerDoc = defineDoc<Ledger>({
     fork: "initial",
     initial: emptyLedger,
 });
+
+/** One conversation that is waiting for the owner, with enough in hand to list it without reading its documents. */
+type InboxEntry = {
+    readonly at: number;
+    readonly count: number;
+    readonly label: string;
+    readonly first: string;
+    readonly answeredAt: number;
+};
+
+type InboxState = { entries: Record<string, InboxEntry> };
+
+/** The cross-conversation inbox: which sessions are waiting, so the panel can show them without opening them. */
+const InboxDoc = defineDoc<InboxState>({
+    kind: "x.pi-pocket-gates.inbox",
+    version: 1,
+    scope: "session",
+    initial: () => ({ entries: {} }),
+});
+
+/** A waiting session drops off the list after this, so a forgotten ask does not stay forever. */
+const INBOX_TTL = 12 * 60 * 60 * 1000;
 
 const openStage = (ledger: Ledger): Stage | undefined => ledger.stages.find((stage) => stage.open);
 
@@ -491,6 +535,29 @@ const settled = (doc: Interview): Set<string> => {
 
 const missing = (doc: Interview): string[] => DIMENSION_KEYS.filter((key) => !settled(doc).has(key));
 
+/**
+ * Dimensions answered with free text rather than one of the offered options.
+ * The owner wrote more than the options covered, so one more round of questions
+ * on that dimension stays allowed even after every dimension is settled.
+ */
+const freeTextDimensions = (doc: Interview): Set<string> => {
+    const out = new Set<string>();
+    for (const question of doc.questions) {
+        const answer = doc.answers[question.id];
+        if (answer === undefined) {
+            continue;
+        }
+        const labels = new Set((question.options ?? []).map((option) => option.label));
+        if (answer.some((value) => value.trim() !== "" && !labels.has(value.trim()))) {
+            const key = dimensionOf(question.dimension);
+            if (key !== undefined) {
+                out.add(key);
+            }
+        }
+    }
+    return out;
+};
+
 const said = (doc: Interview): string =>
     missing(doc)
         .map((key) => key + "（" + (LABELS.get(key) ?? key) + "）")
@@ -508,7 +575,7 @@ function requirementsMarkdown(doc: Interview, cwd: string): string {
     const lines: string[] = [
         "# 需求：" + (doc.title || "未命名"),
         "",
-        "- 会话文件夹：\`" + cwd + "\`",
+        "- 会话文件夹：`" + cwd + "`",
         "- 轮次：" + doc.round,
         "- 更新时间：" + new Date(doc.answeredAt || Date.now()).toISOString(),
         "",
@@ -578,7 +645,7 @@ function traceEnd(stage: Stage): string {
     return [
         "- 结束：" + new Date(stage.endedAt ?? Date.now()).toISOString(),
         "- 结果：" + oneLine(stage.result ?? ""),
-        "- 验证：\`" + (stage.verify || "未运行") + "\` → 退出码 " + (stage.exitCode === undefined ? "未取得" : String(stage.exitCode)),
+        "- 验证：`" + (stage.verify || "未运行") + "` → 退出码 " + (stage.exitCode === undefined ? "未取得" : String(stage.exitCode)),
         ...((stage.evidence ?? []).length === 0
             ? []
             : ["- 文件证据：", ...(stage.evidence ?? []).map((each) => "  - " + each.path + "：" + each.before + " → " + each.after)]),
@@ -593,7 +660,7 @@ function handoffMarkdown(doc: Interview, ledger: Ledger, cwd: string): string {
     const lines = [
         "# 接手说明",
         "",
-        "- 文件夹：\`" + cwd + "\`",
+        "- 文件夹：`" + cwd + "`",
         "- 生成时间：" + new Date().toISOString(),
         "- 当前阶段：" + (stage ? "S" + stage.n + " " + stage.title + "（未收口）" : "无（上一阶段已收口）"),
         "",
@@ -716,11 +783,58 @@ const normalizeProbe = (command: string): string => command.replace(/\s+/gu, " "
  * 脚本真正带来的不同信息有几条：不同命令 + 不同路径（填充命令不算）。
  * 数调用处会被「pwd 加 ls」这种凑数骗过去，数这个不行。
  */
+/**
+ * How many different things a script must touch before it counts as a batch. DeepSeek treats any number as the
+ * target, so a floor of 2 produced exactly two probes per round; raising it makes each round carry more work.
+ */
+export const PROBE_FLOOR = Number(process.env.PI_POCKET_PROBE_FLOOR ?? 3);
+
+/** 认得出的命令名才算探测：脚本里剩下的 JS 片段（`timeout: 90 })` 之类）不算。 */
+const COMMAND_HEADS = new Set([
+    "git", "gh", "npm", "npx", "pnpm", "yarn", "bun", "node", "deno", "tsc", "eslint", "prettier",
+    "pytest", "python", "python3", "pip", "pip3", "ruff", "mypy", "black", "uv",
+    "ls", "cat", "sed", "awk", "grep", "rg", "find", "head", "tail", "wc", "sort", "uniq", "cut", "tr",
+    "xargs", "tee", "diff", "comm", "stat", "file", "du", "df", "readlink", "realpath", "basename", "dirname",
+    "mkdir", "cp", "mv", "rm", "touch", "chmod", "chown", "ln", "tar", "unzip", "zip", "gzip",
+    "curl", "wget", "jq", "sqlite3", "docker", "podman", "systemctl", "journalctl", "ps", "kill", "pgrep",
+    "mise", "cargo", "go", "make", "cmake", "gcc", "clang", "sleep", "timeout", "env", "which", "whereis",
+    "source", "sh", "bash", "zsh", "ffmpeg", "ffprobe", "chromium", "git-lfs", "vitest", "jest", "playwright",
+]);
+const COMMAND_HEAD = /^(?:[A-Za-z_][A-Za-z0-9_]*=\S+\s+)*([A-Za-z][A-Za-z0-9.+-]*)\b/u;
+/** 命令常写在变量里（`const CODE = \`git …``），计数前把赋值头与引号剥掉。 */
+const ASSIGN_HEAD = /^(?:const|let|var)\s+[A-Za-z_$][\w$]*\s*=\s*/u;
+const peelCommand = (piece: string): string => {
+    const peeled = normalizeProbe(piece).replace(ASSIGN_HEAD, "").replace(/^[`"']+/u, "");
+    // 整段脚本里，命令后面常跟着引号与 JS 尾巴（", timeout: 90 })"），在第一个引号处截断。
+    const quote = peeled.search(/[`"']/u);
+    return (quote < 0 ? peeled : peeled.slice(0, quote)).trim();
+};
+
+const probeSegments = (code: string): string[] => {
+    // 模型常把多行命令写进变量、或用 \n 转义，两种都要拆开数。
+    const expanded = code.replace(/\\n/gu, "\n").replace(/\\t/gu, " ");
+    // 命令常由引号与变量拼出来（\"git -C \" + R + \" log …\"）：去掉引号和加号再数一次，否则五行都以同一个前缀开头，只算一条。
+    const joined = expanded.replace(/["'`]/gu, " ").replace(/\s*\+\s*/gu, " ");
+    const sources = [expanded, joined];
+    for (const match of expanded.matchAll(COMMAND_ARG)) {
+        sources.push(match[2] ?? "");
+    }
+    return sources;
+};
+
 export function distinctProbes(code: string): number {
     const found = new Set<string>();
-    for (const match of code.matchAll(COMMAND_ARG)) {
-        const command = normalizeProbe(match[2] ?? "");
-        if (command !== "" && !FILLER.test(command)) {
+    for (const source of probeSegments(code)) {
+        for (const piece of source.split(CHAIN_SPLIT)) {
+            const command = peelCommand(piece).replace(/[,;]+$/u, "").trim();
+            // 带大括号的是 JS 尾巴（\", timeout: 90 })\"），不是命令。
+            if (command === "" || FILLER.test(command) || /[{}]/u.test(command)) {
+                continue;
+            }
+            const head = COMMAND_HEAD.exec(command);
+            if (head === null || !COMMAND_HEADS.has(head[1] ?? "")) {
+                continue;
+            }
             found.add("cmd:" + command);
         }
     }
@@ -732,8 +846,51 @@ export function distinctProbes(code: string): number {
     }
     return found.size;
 }
+/* 测试/检查命令天然就是「跑一条看结果」：脚本里每条命令都是测试类时，允许只放一条。 */
+const CHAIN_SPLIT = /(?:&&|\|\||;|\n)+/u;
+export function onlyTestCommands(code: string): boolean {
+    const segments: string[] = [];
+    for (const match of code.matchAll(COMMAND_ARG)) {
+        for (const piece of normalizeProbe(match[2] ?? "").split(CHAIN_SPLIT)) {
+            const part = piece.trim();
+            if (part !== "") {
+                segments.push(part);
+            }
+        }
+    }
+    return segments.length > 0 && segments.every((part) => TEST_RE.test(part) || /^cd\s/u.test(part));
+}
+
 export const needsMoreCalls = (code: string): boolean =>
-    code !== "" && !NESTED_WRITE.test(code) && distinctProbes(code) < 2 && !BATCHED.test(code);
+    code !== "" &&
+    !NESTED_WRITE.test(code) &&
+    distinctProbes(code) < PROBE_FLOOR &&
+    !BATCHED.test(code) &&
+    !onlyTestCommands(code);
+
+/**
+ * Commands that only create directories: `mkdir -p a b`. An empty directory holds no file, so the
+ * write gate lets it through. Without this, "create the project folder first, then ask the owner"
+ * deadlocks: the folder is the session cwd, the session cannot start without it, and creating it
+ * needed an open stage that asked the owner a question about a folder that did not exist yet.
+ */
+export function onlyMkdirCommands(code: string): boolean {
+    let seen = 0;
+    for (const match of code.matchAll(COMMAND_ARG)) {
+        for (const piece of normalizeProbe(match[2] ?? "").split(CHAIN_SPLIT)) {
+            const command = peelCommand(piece).replace(/[,;]+$/u, "").trim();
+            if (command === "" || FILLER.test(command) || /[{}]/u.test(command)) {
+                continue;
+            }
+            const head = COMMAND_HEAD.exec(command);
+            if (head === null || head[1] !== "mkdir") {
+                return false;
+            }
+            seen += 1;
+        }
+    }
+    return seen > 0;
+}
 
 // 提交返回的是 overlay 代理：事务一结算就读不了（Cannot use a settled overlay），所以回一份纯数据。
 const copyOf = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
@@ -741,6 +898,32 @@ const copyOf = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
 export default function createGates(host: Host, web: Web) {
     const states = new Map<string, BudgetState>();
+    /** How many different things a script must touch to count as a batch. A higher floor buys fewer, fatter rounds. */
+    const STAGE_CALLS = Number(process.env.PI_POCKET_STAGE_CALLS ?? 18);
+
+    /**
+     * The stage's round ceiling. Each round re-pays the whole context, so a stage that keeps rounding instead of
+     * closing is the expensive failure: it gets named, with the two ways out, rather than silently draining.
+     */
+    const chargeStage = (state: BudgetState): string | undefined => {
+        if (state.spentStage === 0) {
+            return undefined;
+        }
+        state.spent += 1;
+        if (state.spent <= STAGE_CALLS) {
+            return undefined;
+        }
+        return (
+            "门禁：S" +
+            state.spentStage +
+            " 已经用掉 " +
+            STAGE_CALLS +
+            " 次工具调用（上限）。现在只有两条路：stage_end 收口，把验证命令和退出码留下；" +
+            "或者 stage_amend 说明为什么还要更多轮，然后重新 stage_begin。" +
+            "每一轮都要重付一遍上下文，轮次本身就是账单。"
+        );
+    };
+
     const stateOf = (id: unknown): BudgetState => {
         const key = String(id);
         let state = states.get(key);
@@ -758,32 +941,16 @@ export default function createGates(host: Host, web: Web) {
         parameters: Type.Object({
             reason: Type.String({ minLength: 5, maxLength: 400 }),
         }),
-        execute: async ({ reason }, api, context) => {
+        execute: async ({ reason }, api) => {
             const state = stateOf(api.conversationId);
             if (state.extra.length >= MAX_EXTRA) {
-                return reply("测试预算：这次会话已经为全量运行申请过 " + MAX_EXTRA + " 次额外次数，不再放行。请把结论交给主规划，由它决定是否开新阶段。");
-            }
-            const asked = {
-                id: "test-rerun:" + String(api.conversationId),
-                conversationId: api.conversationId,
-                taskId: (api as any).taskId,
-                tool: "test_rerun",
-                subject: reason.trim().slice(0, 400),
-                reason: "全量测试已经跑过 " + state.full + " 次（上限 " + MAX_FULL + "），模型要求再跑一次。",
-                createdAt: Date.now(),
-            };
-            const answer = await Promise.race([
-                host.approvals.request(asked as any, context),
-                new Promise<{ allow: boolean; by: string }>((resolve) =>
-                    setTimeout(() => resolve({ allow: false, by: "超过 10 分钟没人答复" }), 10 * 60_000),
-                ),
-            ]);
-            if (!answer.allow) {
-                return reply("测试预算：没有放行这次全量重跑（" + answer.by + "）。用上一次的退出码和输出下结论，不要靠再跑一遍找安全感。");
+                return reply("测试预算：这次会话已经为全量运行用掉 " + MAX_EXTRA + " 次重跑额度，不再放行。把结论交给主规划，由它决定是否开新阶段（新阶段会重置额度）。");
             }
             state.extra.push({ reason: reason.trim(), at: Date.now() });
             state.seen.clear();
-            return reply("负责人 " + answer.by + " 批准了 1 次全量重跑，同指纹命令的冷却已清空。");
+            return reply(
+                "已放行第 " + state.extra.length + "/" + MAX_EXTRA + " 次重跑，理由已记录：" + reason.trim().slice(0, 200) + "。同指纹命令的冷却已清空。",
+            );
         },
     });
 
@@ -926,8 +1093,34 @@ export default function createGates(host: Host, web: Web) {
     /** Question rounds waiting for the panel, by conversation. */
     const waiting = new Map<string, { settle: (answers: Record<string, string[]>) => void; forget: () => void }>();
 
-    const readInterview = async (api: any, context: any): Promise<Interview> =>
-        (await api.snapshot(InterviewDoc, api.conversationId, context)) ?? emptyInterview();
+    /** Which folder each conversation is working in, so the panel routes can find the shared interview. */
+    const folders = new Map<string, string>();
+
+    const sharedOf = async (reader: any, context: any): Promise<SharedInterviews> =>
+        ((await reader.snapshot(SharedDoc, context)) as SharedInterviews | undefined) ?? { byFolder: {} };
+
+    const readInterview = async (api: any, context: any): Promise<Interview> => {
+        const folder = await folderOf(api, context);
+        folders.set(String(api.conversationId), folder);
+        const shared = await sharedOf(api, context);
+        const entry = shared.byFolder[folder];
+        if (entry !== undefined) {
+            return copyOf(entry);
+        }
+        const legacy = (await api.snapshot(InterviewDoc, api.conversationId, context)) ?? emptyInterview();
+        // Self-healing: a conversation that was answered before the folder became the owner of the
+        // requirement seeds the shared copy, so later sessions in this repository inherit it.
+        if (settled(legacy).size > 0) {
+            await api.commit(async (tx: any) => {
+                const next = (await tx.doc(SharedDoc)) ?? { byFolder: {} };
+                if (next.byFolder[folder] === undefined) {
+                    next.byFolder[folder] = copyOf({ ...legacy, folder });
+                }
+                return copyOf(legacy);
+            }, context);
+        }
+        return legacy;
+    };
 
     const readLedger = async (api: any, context: any): Promise<Ledger> =>
         (await api.snapshot(LedgerDoc, api.conversationId, context)) ?? emptyLedger();
@@ -937,13 +1130,21 @@ export default function createGates(host: Host, web: Web) {
         return typeof agent?.cwd === "string" && agent.cwd !== "" ? agent.cwd : ".";
     };
 
-    const patchInterview = async (api: any, context: any, change: (doc: Interview) => void): Promise<Interview> =>
-        api.commit(async (tx: any) => {
-            const doc = (await tx.doc(InterviewDoc, api.conversationId)) ?? emptyInterview();
+    const patchInterview = async (api: any, context: any, change: (doc: Interview) => void): Promise<Interview> => {
+        const folder = await folderOf(api, context);
+        folders.set(String(api.conversationId), folder);
+        return api.commit(async (tx: any) => {
+            const legacy = (await tx.doc(InterviewDoc, api.conversationId)) ?? emptyInterview();
+            const shared = (await tx.doc(SharedDoc)) ?? { byFolder: {} };
+            const doc = copyOf(shared.byFolder[folder] ?? legacy) as Interview;
             change(doc);
             doc.revision += 1;
+            (doc as any).folder = folder;
+            shared.byFolder[folder] = copyOf(doc);
+            Object.assign(legacy, copyOf(doc));
             return copyOf(doc);
         }, context);
+    };
 
     const patchLedger = async (api: any, context: any, change: (doc: Ledger) => void): Promise<Ledger> =>
         api.commit(async (tx: any) => {
@@ -952,6 +1153,31 @@ export default function createGates(host: Host, web: Web) {
             doc.revision += 1;
             return copyOf(doc);
         }, context);
+
+    /** The folder's last segment, which is how a waiting session is recognised in a list. */
+    const cwdLabel = async (api: any, context: any): Promise<string> => {
+        const folder = await folderOf(api, context);
+        const parts = folder.split(sep).filter((part: string) => part !== "");
+        return parts.length > 0 ? parts[parts.length - 1] : folder;
+    };
+
+    /** Puts this conversation on the cross-conversation inbox, so the panel shows it from any session. */
+    const rememberAsk = async (api: any, context: any, questions: readonly Question[]): Promise<void> => {
+        const label = await cwdLabel(api, context);
+        const first = questions.length > 0 ? String(questions[0].question) : "";
+        const count = questions.length;
+        await api.commit(async (tx: any) => {
+            const inbox = (await tx.doc(InboxDoc)) ?? { entries: {} };
+            inbox.entries[String(api.conversationId)] = {
+                at: Date.now(),
+                count,
+                label,
+                first: first.slice(0, 160),
+                answeredAt: 0,
+            };
+            return copyOf(inbox);
+        }, context);
+    };
 
     // ─── Requirements ────────────────────────────────────────────────────────
 
@@ -987,6 +1213,12 @@ export default function createGates(host: Host, web: Web) {
         }),
         execute: async ({ title, questions }, api, context) => {
             const current = await readInterview(api, context);
+            // A dimension the owner answered in free text keeps one more round open: the options did not cover what they said.
+            if (missing(current).length === 0 && freeTextDimensions(current).size === 0) {
+                return reply(
+                    "需求已经收口（7 个维度都有答案或豁免，且没有文本框补充），不要再问一遍：直接 stage_begin 声明这一步要改哪些文件。",
+                );
+            }
             if (current.round >= MAX_ROUNDS) {
                 return reply("追问已到 " + MAX_ROUNDS + " 轮上限，先写需求文档，或请 Owner 在面板上确认豁免。");
             }
@@ -1024,6 +1256,7 @@ export default function createGates(host: Host, web: Web) {
                 doc.askedAt = Date.now();
                 doc.answeredAt = 0;
             });
+            await rememberAsk(api, context, normalized);
             web.send("interview", { conversationId: api.conversationId, round: current.round + 1 });
 
             const answered = await new Promise<Record<string, string[]> | undefined>((resolve) => {
@@ -1202,6 +1435,9 @@ export default function createGates(host: Host, web: Web) {
                 next.counter += 1;
                 next.stages.push(stage);
             });
+            const fresh = stateOf(api.conversationId);
+            fresh.spentStage = stage.n;
+            fresh.spent = 0;
             const path = await appendSpecFile(cwd, "TRACE.md", traceBegin(stage));
             return reply(
                 "已开 S" + stage.n + " " + stage.title + "，痕迹追加到 " + path + "。预期改动的文件：" +
@@ -1322,6 +1558,9 @@ export default function createGates(host: Host, web: Web) {
                 doc.stages = doc.stages.map((each) => (each.n === closed.n ? closed : each));
             });
             const path = await appendSpecFile(cwd, "TRACE.md", traceEnd(closed));
+            const spentState = stateOf(api.conversationId);
+            spentState.spentStage = 0;
+            spentState.spent = 0;
             const doc = await readInterview(api, context);
             await writeSpecFile(cwd, "REQ.md", requirementsMarkdown(doc, cwd));
             return reply(
@@ -1389,6 +1628,13 @@ export default function createGates(host: Host, web: Web) {
     };
 
     const fileGate = async (args: unknown, api: any, context: any): Promise<string | undefined> => {
+        // Creating empty directories writes no file, so it stays allowed before a stage is open.
+        const command = (args as any)?.command;
+        const code = (args as any)?.code;
+        const script = typeof command === "string" ? command : typeof code === "string" ? code : "";
+        if (script !== "" && onlyMkdirCommands(script)) {
+            return undefined;
+        }
         const cwd = await folderOf(api, context);
         const paths = pathsOf(args);
         const outside = paths.filter((path) => !insideSpecs(path, cwd));
@@ -1450,6 +1696,10 @@ export default function createGates(host: Host, web: Web) {
                 if (blocked !== undefined) {
                     return reply(blocked);
                 }
+                const charged = chargeStage(stateOf(api.conversationId));
+                if (charged !== undefined) {
+                    return reply(charged);
+                }
                 const result = await tool.execute(args, api, context);
                 // The file changed, so every test run recorded before this moment is measuring code that no longer exists.
                 stateOf(api.conversationId).mutations += 1;
@@ -1502,9 +1752,12 @@ export default function createGates(host: Host, web: Web) {
             // 只写一处（改文件）放行；只查一处不肯，那正是把一步拆成一轮的写法。
             if (needsMoreCalls(code)) {
                 return reply(
-                    "门禁：这个脚本只有 1 个 tools.* 调用。一步一个调用会把「轮次 × 每轮重付的上下文」一起放大，账单就是这么来的。" +
-                        "把这次要查的东西一次性放进同一个脚本（Promise.allSettled 并发 2 个以上），脚本内部过滤后只贴摘要。" +
-                        "如果这一轮只是读文件或搜文本，ops_batch 更省：一次可放 2–8 个 ops_read/ops_search，不用起脚本。",
+                    "门禁：这个脚本里的独立探测不足 " +
+                        String(PROBE_FLOOR) +
+                        " 个。一步一个调用会把「轮次 × 每轮重付的上下文」一起放大，账单就是这么来的。" +
+                        "把这次要查的东西一次性放进同一个脚本：可以 Promise.allSettled 并发，也可以在一条 bash 里用 && / ; / 换行串起几条不同命令（同一条命令重复不算），脚本内部过滤后只贴摘要。" +
+                        "如果这一轮只是读文件或搜文本，ops_batch 更省：一次可放 2–8 个 ops_read/ops_search，不用起脚本。" +
+                        "例外：脚本里全是测试/检查命令（npm test、tsc、pytest 这类）时，放一条也算合格。",
                 );
             }
             if (NESTED_WRITE.test(code)) {
@@ -1512,6 +1765,10 @@ export default function createGates(host: Host, web: Web) {
                 if (blocked !== undefined) {
                     return reply(blocked);
                 }
+            }
+            const charged = chargeStage(stateOf(api.conversationId));
+            if (charged !== undefined) {
+                return reply(charged);
             }
             const result = await nested.run(true, () => tool.execute(args, api, context));
             return shrinkResult(result, api);
@@ -1532,6 +1789,10 @@ export default function createGates(host: Host, web: Web) {
             const verdict = inspect(state, command);
             if (verdict.action === "block") {
                 return reply(verdict.message);
+            }
+            const charged = chargeStage(state);
+            if (charged !== undefined) {
+                return reply(charged);
             }
             let streamed = "";
             const originalOutput = (api as any)?.output;
@@ -1568,7 +1829,20 @@ export default function createGates(host: Host, web: Web) {
             title: doc.title,
             round: doc.round,
             status: doc.status,
-            questions: doc.questions ?? [],
+            questions: (doc.questions ?? []).filter(
+                (question) => ((doc.answers ?? {})[question.id] ?? []).length === 0,
+            ),
+            answeredCount: (doc.questions ?? []).filter(
+                (question) => ((doc.answers ?? {})[question.id] ?? []).length > 0,
+            ).length,
+            answered: (doc.questions ?? [])
+                .filter((question) => ((doc.answers ?? {})[question.id] ?? []).length > 0)
+                .map((question) => ({
+                    id: question.id,
+                    dimension: question.dimension,
+                    question: question.question,
+                    values: (doc.answers ?? {})[question.id] ?? [],
+                })),
             answers: doc.answers ?? {},
             waived: doc.waived ?? {},
             pendingWaive: doc.pendingWaive ?? {},
@@ -1578,11 +1852,47 @@ export default function createGates(host: Host, web: Web) {
     };
 
     web.client("pi-pocket-gates", { access: "owner" });
+    /**
+     * Every conversation that is waiting, for the panel's single entry point. It answers from this document alone, so
+     * reading it never opens another session's documents.
+     */
+    web.route(
+        "GET",
+        "inbox",
+        async (request: any) => {
+            const inbox = (await request.snapshot(InboxDoc, request.context)) ?? { entries: {} };
+            const now = Date.now();
+            const items: Array<{ conversationId: number | string; label: string; count: number; first: string; at: number }> = [];
+            for (const [id, entry] of Object.entries(inbox.entries ?? {})) {
+                if (entry === null || typeof entry !== "object") {
+                    continue;
+                }
+                if (entry.count <= 0 || now - entry.at > INBOX_TTL) {
+                    continue;
+                }
+                const numeric = Number(id);
+                items.push({
+                    conversationId: Number.isFinite(numeric) ? numeric : id,
+                    label: entry.label,
+                    count: entry.count,
+                    first: entry.first,
+                    at: entry.at,
+                });
+            }
+            items.sort((left, right) => left.at - right.at);
+            return { items };
+        },
+        { access: "owner" },
+    );
     web.conversationRoute(
         "GET",
         "interview/:source",
         async (request: any) => {
-            const doc = (await request.snapshot(InterviewDoc, request.conversation.id, request.context)) ?? emptyInterview();
+            const legacy = (await request.snapshot(InterviewDoc, request.conversation.id, request.context)) ?? emptyInterview();
+            const cached = folders.get(String(request.conversation.id));
+            const folder = cached !== undefined ? cached : typeof (legacy as any).folder === "string" ? String((legacy as any).folder) : "";
+            const shared = await sharedOf(request, request.context);
+            const doc = (folder !== "" ? shared.byFolder[folder] : undefined) ?? legacy;
             const ledger = (await request.snapshot(LedgerDoc, request.conversation.id, request.context)) ?? emptyLedger();
             return view(doc, ledger);
         },
@@ -1592,6 +1902,9 @@ export default function createGates(host: Host, web: Web) {
         "POST",
         "interview/:source",
         async (request: any) => {
+            const known = (await request.snapshot(InterviewDoc, request.conversation.id, request.context)) as Interview | undefined;
+            const cached = folders.get(String(request.conversation.id));
+            const folder = cached !== undefined ? cached : typeof (known as any)?.folder === "string" ? String((known as any).folder) : "";
             const body = request.body ?? {};
             const raw = Array.isArray(body.answers) ? body.answers : [];
             const arriving: Record<string, string[]> = {};
@@ -1606,13 +1919,22 @@ export default function createGates(host: Host, web: Web) {
                 throw web.error(400, "No answers to record.");
             }
             const doc = await request.commit(async (tx: any) => {
-                const next = (await tx.doc(InterviewDoc, request.conversation.id)) ?? emptyInterview();
+                const legacy = (await tx.doc(InterviewDoc, request.conversation.id)) ?? emptyInterview();
+                const shared = (await tx.doc(SharedDoc)) ?? { byFolder: {} };
+                const next = copyOf((folder !== "" ? shared.byFolder[folder] : undefined) ?? legacy) as Interview;
                 for (const [id, values] of Object.entries(arriving)) {
                     next.answers[id] = values;
                 }
                 next.status = "answered";
                 next.answeredAt = Date.now();
                 next.revision += 1;
+                if (folder !== "") {
+                    (next as any).folder = folder;
+                    shared.byFolder[folder] = copyOf(next);
+                }
+                Object.assign(legacy, copyOf(next));
+                const inbox = (await tx.doc(InboxDoc)) ?? { entries: {} };
+                delete inbox.entries[String(request.conversation.id)];
                 return copyOf(next);
             });
             waiting.get(String(request.conversation.id))?.settle(arriving);
@@ -1621,10 +1943,34 @@ export default function createGates(host: Host, web: Web) {
         },
         { conversation: "source", access: "owner" },
     );
+    /** Owner-only: copy an existing conversation interview into the shared copy for a folder. */
+    web.conversationRoute(
+        "POST",
+        "adopt/:source",
+        async (request: any) => {
+            const body = request.body ?? {};
+            const folder = clampText(body.folder, 500);
+            if (folder === "") {
+                throw web.error(400, "需要 folder。");
+            }
+            const doc = await request.commit(async (tx: any) => {
+                const legacy = (await tx.doc(InterviewDoc, request.conversation.id)) ?? emptyInterview();
+                const shared = (await tx.doc(SharedDoc)) ?? { byFolder: {} };
+                (legacy as any).folder = folder;
+                shared.byFolder[folder] = copyOf({ ...legacy, folder });
+                return copyOf(legacy);
+            });
+            return { ok: true, folder, answered: Object.keys(doc.answers).length, missing: missing(doc) };
+        },
+        { conversation: "source", access: "owner" },
+    );
     web.conversationRoute(
         "POST",
         "waive/:source",
         async (request: any) => {
+            const known = (await request.snapshot(InterviewDoc, request.conversation.id, request.context)) as Interview | undefined;
+            const cached = folders.get(String(request.conversation.id));
+            const folder = cached !== undefined ? cached : typeof (known as any)?.folder === "string" ? String((known as any).folder) : "";
             const body = request.body ?? {};
             const dimension = dimensionOf(clampText(body.dimension, 40));
             if (dimension === undefined) {
@@ -1632,7 +1978,9 @@ export default function createGates(host: Host, web: Web) {
             }
             const approve = body.approve === true;
             const doc = await request.commit(async (tx: any) => {
-                const next = (await tx.doc(InterviewDoc, request.conversation.id)) ?? emptyInterview();
+                const legacy = (await tx.doc(InterviewDoc, request.conversation.id)) ?? emptyInterview();
+                const shared = (await tx.doc(SharedDoc)) ?? { byFolder: {} };
+                const next = copyOf((folder !== "" ? shared.byFolder[folder] : undefined) ?? legacy) as Interview;
                 const asked = next.pendingWaive[dimension];
                 if (asked === undefined) {
                     throw web.error(409, "No waiver request for that dimension.");
@@ -1642,6 +1990,11 @@ export default function createGates(host: Host, web: Web) {
                 }
                 delete next.pendingWaive[dimension];
                 next.revision += 1;
+                if (folder !== "") {
+                    (next as any).folder = folder;
+                    shared.byFolder[folder] = copyOf(next);
+                }
+                Object.assign(legacy, copyOf(next));
                 return copyOf(next);
             });
             web.send("interview-waive-done", { conversationId: request.conversation.id, dimension, approve });

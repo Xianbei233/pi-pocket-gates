@@ -34,6 +34,8 @@ export default function setup(pocket) {
         const [texts, setTexts] = useState({});
         const [error, setError] = useState("");
         const [sending, setSending] = useState(false);
+        const [showAnswered, setShowAnswered] = useState(false);
+        const [inbox, setInbox] = useState([]);
         const id = pocket.conversationId();
 
         const load = useCallback(async () => {
@@ -147,10 +149,35 @@ export default function setup(pocket) {
             </div>`;
         }
 
+        useEffect(() => {
+            let alive = true;
+            const refresh = async () => {
+                try {
+                    const state = await pocket.api("inbox");
+                    if (!alive) {
+                        return;
+                    }
+                    const items = state?.items ?? [];
+                    setInbox(items);
+                    panelButton.update({ badge: items.length > 0 ? String(items.length) : null });
+                } catch {
+                    // The inbox is a convenience: a failed poll leaves the screen as it was.
+                }
+            };
+            void refresh();
+            const timer = setInterval(() => void refresh(), 20000);
+            return () => {
+                alive = false;
+                clearInterval(timer);
+            };
+        }, []);
+
         const pending = Object.entries(view.pendingWaive ?? {}).filter(
             (entry) => entry[1] !== null && typeof entry[1] === "object",
         );
         const hasQuestions = (view.questions ?? []).length > 0;
+        const others = (inbox ?? []).filter((each) => String(each.conversationId) !== String(id));
+        const answered = view.answered ?? [];
 
         return html`<div class="spec-panel">
             <header class="spec-head">
@@ -177,6 +204,26 @@ export default function setup(pocket) {
                                       拒绝
                                   </button>
                               </div>
+                          </div>`,
+                      )}
+                  </div>`
+                : null}
+
+            ${others.length > 0
+                ? html`<div class="spec-inbox">
+                      <div class="spec-inbox-head">${"其他会话在等你（" + others.length + "）"}</div>
+                      ${others.map(
+                          (item) => html`<div class="spec-inbox-row" key=${String(item.conversationId)}>
+                              <div class="spec-inbox-text">
+                                  <b>${item.label || "会话 " + item.conversationId}</b>
+                                  <em>${item.count + " 个问题 · " + (item.first || "")}</em>
+                              </div>
+                              <button
+                                  class="button ghost small"
+                                  onClick=${() => pocket.openConversation(item.conversationId)}
+                              >
+                                  去回答
+                              </button>
                           </div>`,
                       )}
                   </div>`
@@ -229,6 +276,25 @@ export default function setup(pocket) {
                   </div>`
                 : html`<p class="spec-hint">这个会话还没有提问。</p>`}
 
+            ${answered.length > 0
+                ? html`<div class="spec-answered">
+                      <button class="spec-answered-toggle" onClick=${() => setShowAnswered(!showAnswered)}>
+                          ${"已答 " + answered.length + " 题" + (showAnswered ? "（收起）" : "（展开）")}
+                      </button>
+                      ${showAnswered
+                          ? html`<div class="spec-answered-list">
+                                ${answered.map(
+                                    (item) => html`<div class="spec-answered-row" key=${item.id}>
+                                        <span class="spec-dim">${dimOf(item.dimension)}</span>
+                                        <p>${item.question}</p>
+                                        <em>${(item.values ?? []).join("、")}</em>
+                                    </div>`,
+                                )}
+                            </div>`
+                          : null}
+                  </div>`
+                : null}
+
             ${error ? html`<p class="spec-error">${error}</p>` : null}
 
             <footer class="spec-foot">
@@ -243,7 +309,8 @@ export default function setup(pocket) {
     }
 
     pocket.style("style.css");
-    pocket.panel({ id: "interview", title: "需求追问", component: Interview });
+    // `panel` already puts one button in the top bar, so the waiting count rides on that same button: one icon, one entry.
+    const panelButton = pocket.panel({ id: "interview", title: "需求追问", component: Interview });
 
     pocket.on("interview-answered", () => {
         pocket.notify("info", "需求回答已记录，模型继续。");
