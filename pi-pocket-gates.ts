@@ -868,6 +868,30 @@ export const needsMoreCalls = (code: string): boolean =>
     !BATCHED.test(code) &&
     !onlyTestCommands(code);
 
+/**
+ * Commands that only create directories: `mkdir -p a b`. An empty directory holds no file, so the
+ * write gate lets it through. Without this, "create the project folder first, then ask the owner"
+ * deadlocks: the folder is the session cwd, the session cannot start without it, and creating it
+ * needed an open stage that asked the owner a question about a folder that did not exist yet.
+ */
+export function onlyMkdirCommands(code: string): boolean {
+    let seen = 0;
+    for (const match of code.matchAll(COMMAND_ARG)) {
+        for (const piece of normalizeProbe(match[2] ?? "").split(CHAIN_SPLIT)) {
+            const command = peelCommand(piece).replace(/[,;]+$/u, "").trim();
+            if (command === "" || FILLER.test(command) || /[{}]/u.test(command)) {
+                continue;
+            }
+            const head = COMMAND_HEAD.exec(command);
+            if (head === null || head[1] !== "mkdir") {
+                return false;
+            }
+            seen += 1;
+        }
+    }
+    return seen > 0;
+}
+
 // 提交返回的是 overlay 代理：事务一结算就读不了（Cannot use a settled overlay），所以回一份纯数据。
 const copyOf = <T>(value: T): T => JSON.parse(JSON.stringify(value)) as T;
 
@@ -1604,6 +1628,13 @@ export default function createGates(host: Host, web: Web) {
     };
 
     const fileGate = async (args: unknown, api: any, context: any): Promise<string | undefined> => {
+        // Creating empty directories writes no file, so it stays allowed before a stage is open.
+        const command = (args as any)?.command;
+        const code = (args as any)?.code;
+        const script = typeof command === "string" ? command : typeof code === "string" ? code : "";
+        if (script !== "" && onlyMkdirCommands(script)) {
+            return undefined;
+        }
         const cwd = await folderOf(api, context);
         const paths = pathsOf(args);
         const outside = paths.filter((path) => !insideSpecs(path, cwd));
